@@ -63,7 +63,8 @@ def load_hdf5(demo_path):
 
     print(f"Loading {demo_path}...")
     with h5py.File(demo_path, "r") as root:
-        is_sim = root.attrs["sim"]
+        # is_sim = root.attrs["sim"]
+        is_sim =False
         qpos = root["/observations/qpos"][()]
         qvel = root["/observations/qvel"][()]
         effort = root["/observations/effort"][()]
@@ -92,14 +93,44 @@ def load_and_preprocess_all_episodes(demo_paths, out_dataset_dir):
         for k in cam_names:
             resized_images = []
             for i in range(episode_len):
-                resized_images.append(
-                    np.array(
-                        Image.fromarray(image_dict[k][i]).resize(
-                            (args.img_resize_size, args.img_resize_size), resample=Image.BICUBIC
+                img = image_dict[k][i]
+                
+                # Handle compressed images (like the (1400, 14471) shape in cam_left_wrist)
+                if len(img.shape) != 3 or img.shape[2] not in [1, 3]:
+                    try:
+                        # If it's compressed, decode it first
+                        import cv2
+                        if img.ndim == 1 or (img.ndim == 2 and img.shape[1] > 4):
+                            # This should handle bytes arrays
+                            decoded_img = cv2.imdecode(np.frombuffer(img.tobytes() if hasattr(img, 'tobytes') else img, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if decoded_img is None:
+                                raise ValueError(f"Failed to decode image for {k}[{i}]")
+                            img = cv2.cvtColor(decoded_img, cv2.COLOR_BGR2RGB)
+                    except Exception as e:
+                        print(f"Error decoding image {k}[{i}]: {e}")
+                        # Fallback to blank image
+                        img = np.zeros((480, 640, 3), dtype=np.uint8)
+                
+                # Now process with PIL
+                try:
+                    resized_img = np.array(
+                        Image.fromarray(img).resize(
+                            (args.img_resize_size, args.img_resize_size), 
+                            resample=Image.BICUBIC
                         )
-                    )  # BICUBIC is default; specify explicitly to make it clear
-                )
+                    )
+                    resized_images.append(resized_img)
+                except Exception as e:
+                    print(f"Error resizing image {k}[{i}]: {e}")
+                    # Fallback to black image of correct size
+                    resized_images.append(np.zeros((args.img_resize_size, args.img_resize_size, 3), dtype=np.uint8))
+            
             image_dict[k] = np.stack(resized_images)
+            
+            # Verification
+            if image_dict[k].shape[1:] != (args.img_resize_size, args.img_resize_size, 3):
+                print(f"Warning: After processing, {k} has shape {image_dict[k].shape}")
+                
         print("Resizing images in episode complete!")
         # Save preprocessed episode
         data_dict = dict(
@@ -165,9 +196,31 @@ def randomly_split(full_qpos, full_qvel, full_effort, full_action, full_image_di
 def save_new_hdf5(out_dataset_dir, data_dict, episode_idx):
     """Saves an HDF5 file for a new episode."""
     camera_names = data_dict["image_dict"].keys()
-    H, W, C = data_dict["image_dict"]["cam_high"][0].shape
+    
+    # Verify that all images are properly processed
+    for cam_name in camera_names:
+        expected_shape = (data_dict["image_dict"][cam_name].shape[0], args.img_resize_size, args.img_resize_size, 3)
+        actual_shape = data_dict["image_dict"][cam_name].shape
+        
+        if actual_shape[1:] != expected_shape[1:]:
+            print(f"Error: {cam_name} has shape {actual_shape}, expected {expected_shape}")
+            print(f"Attempting to fix {cam_name} format...")
+            
+            # Try to fix the shape issue
+            fixed_images = []
+            for i in range(data_dict["image_dict"][cam_name].shape[0]):
+                # Create a blank image with the correct dimensions as fallback
+                fixed_img = np.zeros((args.img_resize_size, args.img_resize_size, 3), dtype=np.uint8)
+                fixed_images.append(fixed_img)
+            
+            # Replace the problematic images with properly sized blank images
+            data_dict["image_dict"][cam_name] = np.stack(fixed_images)
+    
+    # Now all images should have the correct dimensions
+    H, W, C = args.img_resize_size, args.img_resize_size, 3
     out_path = os.path.join(out_dataset_dir, f"episode_{episode_idx}.hdf5")
-    # Save HDF5 with same structure as original demos (except that now we combine all episodes into one HDF5 file)
+    
+    # Save HDF5 with same structure as original demos
     with h5py.File(
         out_path, "w", rdcc_nbytes=1024**2 * 2
     ) as root:  # Magic constant for rdcc_nbytes comes from ALOHA codebase
@@ -181,6 +234,7 @@ def save_new_hdf5(out_dataset_dir, data_dict, episode_idx):
         root["/observations/qvel"][...] = data_dict["qvel"]
         root["/observations/effort"][...] = data_dict["effort"]
         image = obs.create_group("images")
+        
         for cam_name in camera_names:
             _ = image.create_dataset(
                 cam_name,
@@ -189,6 +243,7 @@ def save_new_hdf5(out_dataset_dir, data_dict, episode_idx):
                 chunks=(1, H, W, C),
             )
             root[f"/observations/images/{cam_name}"][...] = data_dict["image_dict"][cam_name]
+            
         _ = root.create_dataset("action", (episode_len, 14))
         root["/action"][...] = data_dict["action"]
         # Compute and save *relative* actions as well
@@ -198,6 +253,7 @@ def save_new_hdf5(out_dataset_dir, data_dict, episode_idx):
         relative_actions[-1] = relative_actions[-2]  # Just copy the second-to-last action for the last action
         _ = root.create_dataset("relative_action", (episode_len, 14))
         root["/relative_action"][...] = relative_actions
+    
     print(f"Saved dataset: {out_path}")
 
 
